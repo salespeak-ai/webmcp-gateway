@@ -1,16 +1,18 @@
-# Build a WebMCP Gateway: Let AI Assistants Talk to Any Website
+# How We Built WebMCP Gateway: Letting AI Assistants Talk to Any Website
 
-*How we built an open-source MCP server that bridges Claude and ChatGPT to websites using a headless browser*
+*We built an open-source MCP server that bridges Claude and ChatGPT to websites using a headless browser. Here's every layer of how it works.*
 
 ---
 
-Every website has knowledge locked behind its UI — pricing pages, knowledge bases, chat widgets, booking forms. AI assistants like Claude and ChatGPT can't access any of it. They can't click buttons, fill forms, or wait for a chat widget to respond.
+Every website has knowledge locked behind its UI. Pricing buried three clicks deep. A knowledge base that only works if you type into the search box. A chat widget that knows everything about the company but can only talk to humans.
 
-**WebMCP** changes that. It's a [new browser standard](https://developer.chrome.com/blog/webmcp-epp) where websites declare what AI agents can do via `navigator.modelContext.registerTool()`. Think of it as an API that lives in the browser — no backend integration needed.
+AI assistants like Claude and ChatGPT can't access any of it. They can't click buttons, fill forms, or wait for a chat widget to think for 10 seconds before responding.
 
-But there's a gap: AI assistants speak **MCP** (Model Context Protocol), websites speak **WebMCP**, and nobody translates between them.
+[WebMCP](https://developer.chrome.com/blog/webmcp-epp) changes that. It's a new browser standard from Google where websites declare their capabilities through `navigator.modelContext.registerTool()`. Instead of scraping DOMs or puppeteering browsers, AI agents can discover what a site offers and call it like a structured API.
 
-So we built [**WebMCP Gateway**](https://github.com/salespeak-ai/webmcp-gateway) — an open-source MCP server that uses a headless Playwright browser to discover WebMCP tools on any website and exposes them as MCP tools that Claude and ChatGPT can call directly.
+But here's the gap nobody was filling: AI assistants speak **MCP** (Model Context Protocol). Websites speak **WebMCP**. Same family, different languages. No translator in the room.
+
+So we built [**WebMCP Gateway**](https://github.com/salespeak-ai/webmcp-gateway) — an open-source MCP server that uses a headless Playwright browser to discover WebMCP tools on any website and expose them to Claude and ChatGPT. You install it, point it at a URL, and ask your question. The gateway handles the browser, the tool discovery, and the waiting.
 
 ```
 ┌──────────────┐      MCP       ┌──────────────────┐   Playwright   ┌──────────────────┐
@@ -19,15 +21,15 @@ So we built [**WebMCP Gateway**](https://github.com/salespeak-ai/webmcp-gateway)
 └──────────────┘               └──────────────────┘               └──────────────────┘
 ```
 
-This post walks through exactly how it works, how to set it up, and how to extend it.
+This post walks through exactly how it works — the detection chain, the browser interception trick, the smart tool selection, and how to set it up in five minutes.
 
 ---
 
 ## The Problem: Two Protocols, No Bridge
 
-**MCP** (Model Context Protocol) is how AI assistants discover and call tools. Claude Desktop, Claude Code, ChatGPT plugins — they all speak MCP. An MCP server exposes tools like `search_docs(query)` or `create_ticket(title, body)`, and the AI calls them.
+**MCP** is how AI assistants discover and call external tools. Claude Desktop, Claude Code, ChatGPT — they all speak MCP. You give them a server that exposes functions like `search_docs(query)` or `create_ticket(title)`, and the AI calls them when it needs to.
 
-**WebMCP** is how websites expose capabilities to AI agents running in the browser. A website registers tools via JavaScript:
+**WebMCP** is how websites expose capabilities to AI agents in the browser. A website registers tools in JavaScript:
 
 ```javascript
 navigator.modelContext.registerTool({
@@ -40,44 +42,61 @@ navigator.modelContext.registerTool({
 });
 ```
 
-The problem: these two worlds don't talk to each other. Claude can't just "visit a website" and discover its WebMCP tools. There's no browser in the loop.
+The problem: these two don't talk to each other. Claude can't "visit" a website and call its WebMCP tools. There's no browser in the loop.
 
-**The gateway is that browser.**
+The gateway is that browser.
 
 ---
 
-## Architecture: How It Works
+## Architecture: How It Actually Works
 
-The gateway is a Python MCP server (~300 lines of core code) built on three layers:
+The whole thing is about 300 lines of Python across five files. It's built as a pipeline with three layers, each one doing progressively more work.
 
-### Layer 1: Fast Detection (`detect.py`)
+### Layer 1: Fast Detection — No Browser Needed
 
-Before launching a browser, we do a quick HTTP fetch and scan the HTML with regex:
+Spinning up a headless browser takes time and resources. Before we commit to that, we do something much cheaper: download the page HTML and scan it with regex.
 
 ```python
-# Check for declarative forms: <form tool-name="ask_question">
-form_tags = re.findall(r'<form\b([^>]*\btool-name=[^>]*)>', html, re.I)
+def detect_webmcp_fast(url: str, timeout: float = 10.0) -> DetectionResult:
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            resp = client.get(url, headers={"User-Agent": _USER_AGENT})
+            html = resp.text
+    except Exception:
+        return DetectionResult(found=False, provider="none")
 
-# Check for imperative registration in inline scripts
-register_matches = re.findall(
-    r'(?:navigator\.modelContext|modelContext)\.registerTool\s*\('
-    r'\s*\{[^}]*name\s*:\s*["\']([^"\']+)["\']',
-    html,
-)
+    # Check 1: Declarative forms — <form tool-name="ask_question">
+    form_tags = re.findall(r'<form\b([^>]*\btool-name=[^>]*)>', html, re.I)
+    if form_tags:
+        # ... extract tool names and descriptions
+        return DetectionResult(found=True, provider="webmcp_declarative", tools=tools)
 
-# Check for any modelContext reference
-if re.search(r"navigator\.modelContext", html):
-    return DetectionResult(found=True, provider="webmcp_generic")
+    # Check 2: Imperative JS — navigator.modelContext.registerTool()
+    register_matches = re.findall(
+        r'(?:navigator\.modelContext|modelContext)\.registerTool\s*\(\s*\{'
+        r'[^}]*name\s*:\s*["\']([^"\']+)["\']',
+        html,
+    )
+    if register_matches:
+        return DetectionResult(found=True, provider="webmcp_imperative", tools=tools)
+
+    # Check 3: Any mention of navigator.modelContext
+    if re.search(r"navigator\.modelContext", html):
+        return DetectionResult(found=True, provider="webmcp_generic")
+
+    return DetectionResult(found=False, provider="none")
 ```
 
-This is instant and free — no browser, no overhead. It tells you "yes, this site probably has WebMCP tools" without committing to a full browser session.
+Three checks in priority order: declarative HTML forms, imperative JS registrations, then any generic modelContext reference. This runs in milliseconds. If it finds nothing, we skip the browser entirely and save everyone the wait.
 
-### Layer 2: Browser Discovery (`browser.py`)
+### Layer 2: Browser Discovery — The Interception Trick
 
-The real magic. We launch headless Chromium via Playwright and inject a script **before the page loads** that intercepts `registerTool()`:
+Here's where it gets clever. WebMCP tools are usually registered dynamically — JavaScript runs, widgets load asynchronously, and tools get registered after the page finishes rendering. You'll never find these with a static HTML scan.
+
+So we launch headless Chromium and inject a script **before the page even loads**:
 
 ```javascript
-// Injected BEFORE page load via page.add_init_script()
+// Injected via page.add_init_script() — runs before ANY page JavaScript
 (() => {
     window.__webmcp_tools = {};
     window.__webmcp_ready = false;
@@ -86,10 +105,8 @@ The real magic. We launch headless Chromium via Playwright and inject a script *
         if (!navigator.modelContext) return;
         clearInterval(hookInterval);
 
-        // Monkey-patch registerTool to capture definitions
-        const original = navigator.modelContext.registerTool.bind(
-            navigator.modelContext
-        );
+        // Monkey-patch registerTool to capture every definition
+        const original = navigator.modelContext.registerTool.bind(navigator.modelContext);
         navigator.modelContext.registerTool = (toolDef) => {
             window.__webmcp_tools[toolDef.name] = {
                 name: toolDef.name,
@@ -97,14 +114,16 @@ The real magic. We launch headless Chromium via Playwright and inject a script *
                 inputSchema: toolDef.inputSchema || {},
                 execute: toolDef.execute,  // Keep the callback!
             };
-            original(toolDef);  // Still register it normally
+            original(toolDef);  // Still register normally — page works fine
         };
         window.__webmcp_ready = true;
     }, 50);
 })();
 ```
 
-The key detail: we store the `execute` callback. This is the function we'll call later to actually invoke the tool.
+This is the core trick: we wrap `registerTool` before the page's own scripts get to it. Every tool that registers itself gets captured — name, description, schema, and crucially, the `execute` callback. We store that callback because we're going to call it later.
+
+The page doesn't know anything happened. Its tools still register normally. We're just eavesdropping.
 
 On the Python side:
 
@@ -116,19 +135,17 @@ async with async_playwright() as p:
     )
     page = await (await browser.new_context()).new_page()
 
-    # Inject BEFORE page load
-    await page.add_init_script(_INTERCEPT_SCRIPT)
+    await page.add_init_script(_INTERCEPT_SCRIPT)  # Before page load!
 
-    # Navigate
     await page.goto(url, wait_until="domcontentloaded")
 
-    # Wait for tools to register (15s timeout)
+    # Wait up to 15 seconds for tools to register
     await page.wait_for_function(
         "window.__webmcp_ready === true && "
         "Object.keys(window.__webmcp_tools).length > 0"
     )
 
-    # Read discovered tools
+    # Read what we caught
     tools = await page.evaluate("""
         Object.values(window.__webmcp_tools).map(t => ({
             name: t.name,
@@ -138,37 +155,66 @@ async with async_playwright() as p:
     """)
 ```
 
-### Layer 3: Tool Invocation
+### Layer 3: Smart Tool Selection and Invocation
 
-Once we have tools, calling them is one line of JavaScript — but the semantics matter:
+A website might expose one tool or five. Some are simple Q&A (pass a question, get an answer). Others are structured (pass a category, price range, and feature list to search products). The gateway needs to figure out which one to call.
+
+The logic is straightforward:
+
+```python
+def _is_simple_question_tool(input_schema):
+    """Does this tool just take a question string?"""
+    props = input_schema.get("properties", {})
+    if not props:
+        return True  # No schema = treat as simple
+    if "question" in props or "query" in props:
+        return True
+    return False
+```
+
+Selection priority:
+1. If the AI passed `tool_args` (structured arguments) → find a structured tool
+2. If the AI passed `question` → look for known Q&A names: `ask_question`, `ask`, `chat`, `search`, `query`
+3. Fall back to the first tool that registered
+
+And here's the smart part: if a structured tool is found but the AI only sent a question (no structured args), the gateway doesn't guess. It returns the tool's schema so the AI can fill in the fields and call again:
+
+```
+Claude: call_tool("travel.com", question="flights to Paris")
+Gateway: "This tool needs structured args. Schema: {destination, date, passengers}"
+Claude: call_tool("travel.com", tool_args='{"destination":"Paris","date":"2026-06-15"}')
+Gateway: "Found 12 flights. Cheapest: $420 on Air France..."
+```
+
+Two-step dance. The AI figures out the right arguments on its own.
+
+### The Invocation Itself
+
+Once we know what to call, one line of JavaScript does the real work:
 
 ```javascript
-// This is what the gateway runs in the browser
 const result = await tool.execute(args);
 ```
 
-That `await` is critical. The tool's `execute()` returns a **Promise** that stays pending until the actual answer is ready. For a chat widget backed by an LLM, that could be 5-30 seconds. The gateway waits for the real answer, not just a "message sent" confirmation.
+That `await` is the whole point. The tool's `execute()` returns a Promise that stays pending until the real answer is ready. For a chat widget backed by an LLM, that might take 5–30 seconds. The gateway waits. It doesn't return "message delivered" — it returns the actual response.
 
-We parse whatever comes back:
+The result parsing handles whatever format comes back:
 
 ```javascript
 let answer = '';
 if (typeof result === 'string') {
     answer = result;
 } else if (result?.content && Array.isArray(result.content)) {
-    // MCP content format: { content: [{ type: 'text', text: '...' }] }
-    answer = result.content
-        .filter(c => c.type === 'text')
-        .map(c => c.text)
-        .join('\n');
+    // Standard MCP format: { content: [{ type: 'text', text: '...' }] }
+    answer = result.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
 } else if (result && typeof result === 'object') {
     answer = JSON.stringify(result);
 }
 ```
 
-### Layer 4: MCP Server (`server.py`)
+### Tying It All Together: The MCP Server
 
-All three layers are wrapped in a FastMCP server that exposes three tools:
+All three layers are wrapped in a FastMCP server — five lines of setup, three tool definitions:
 
 ```python
 from mcp.server.fastmcp import FastMCP
@@ -194,9 +240,11 @@ def call_tool(url: str, question: str = None, ...) -> str:
     return json.dumps({ "answer": result.answer, ... })
 ```
 
+That's the entire server. Three tools that map to three layers of the pipeline.
+
 ---
 
-## Setup: 5 Minutes to "Ask Any Website"
+## Setup: Five Minutes to "Ask Any Website"
 
 ### Install
 
@@ -207,7 +255,7 @@ pip install -e .
 playwright install chromium
 ```
 
-### Connect to Claude Desktop
+### Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -222,16 +270,14 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop. Now you can ask:
+Restart Claude Desktop. Now you can ask something like: *"Check if acme-corp.com has WebMCP tools and ask them about their enterprise pricing."*
 
-> "Check if acme-corp.com has WebMCP tools and ask them about their enterprise pricing."
+Claude will chain the calls itself:
+1. `check_webmcp("https://acme-corp.com")` — fast pre-check
+2. `discover_tools("https://acme-corp.com")` — find what's available
+3. `call_tool("https://acme-corp.com", question="What is your enterprise pricing?")` — get the answer
 
-Claude will:
-1. Call `check_webmcp("https://acme-corp.com")` — fast pre-check
-2. Call `discover_tools("https://acme-corp.com")` — find available tools
-3. Call `call_tool("https://acme-corp.com", question="What is your enterprise pricing?")` — get the answer
-
-### Connect to Claude Code
+### Claude Code
 
 Add to your project's `.mcp.json`:
 
@@ -246,65 +292,35 @@ Add to your project's `.mcp.json`:
 }
 ```
 
-### Run as SSE Server (ChatGPT, remote clients)
+### SSE Mode (Remote Clients, ChatGPT)
 
 ```bash
 webmcp-gateway --transport sse --port 8808
 ```
 
----
-
-## Smart Tool Selection
-
-Not all WebMCP tools are simple Q&A. Some are structured — they need specific parameters like `category`, `date`, or `destination`. The gateway handles both:
-
-**Simple tools** (most common): Have a `question` or `query` property, or no schema at all. The gateway auto-detects these and passes the user's question directly.
-
-```python
-def _is_simple_question_tool(input_schema):
-    props = input_schema.get("properties", {})
-    if not props:
-        return True  # No schema = treat as simple
-    if "question" in props or "query" in props:
-        return True  # Has a question field
-    return False
-```
-
-**Structured tools**: Have specific fields like `category`, `max_price`, etc. The gateway returns the schema to the AI, which fills in the fields and calls again:
-
-```
-AI: call_tool("https://travel.com", question="flights to Paris")
-Gateway: "This tool requires structured args. Schema: {destination, date, passengers}"
-AI: call_tool("https://travel.com", tool_args='{"destination":"Paris","date":"2025-06-15"}')
-Gateway: "Found 12 flights. Cheapest: $420 on Air France..."
-```
-
-The auto-selection priority:
-1. If `tool_args` provided → find a structured tool
-2. Try well-known names: `ask_question`, `ask`, `chat`, `search`, `query`
-3. Fall back to the first registered tool
+Any MCP client that supports SSE transport can connect to `http://your-server:8808`.
 
 ---
 
-## Testing with the Demo Site
+## Test Drive: The Demo Site
 
-The repo includes a demo site (`examples/demo_site.html`) that registers two tools:
+The repo includes a demo site (`examples/demo_site.html`) that registers two tools so you can try the full flow locally:
 
 ```javascript
-// Simple Q&A tool
+// A simple Q&A tool
 navigator.modelContext.registerTool({
   name: "ask_question",
   description: "Ask about our products",
   execute: async ({ question }) => {
-    await new Promise(r => setTimeout(r, 2000)); // Simulate LLM delay
+    await new Promise(r => setTimeout(r, 2000)); // Simulate LLM thinking
     return { content: [{ type: "text", text: "Our pricing starts at..." }] };
   }
 });
 
-// Structured tool
+// A structured search tool
 navigator.modelContext.registerTool({
   name: "search_products",
-  description: "Search by category and price",
+  description: "Search by category and price range",
   inputSchema: {
     properties: {
       category: { type: "string" },
@@ -313,49 +329,59 @@ navigator.modelContext.registerTool({
     required: ["category"]
   },
   execute: async ({ category, max_price }) => {
-    // Filter and return products
+    // Filter products, return results
   }
 });
 ```
 
-Serve it locally and point the gateway at it:
+Serve it and point Claude at it:
 
 ```bash
 python -m http.server 8000 -d examples/
-# Then in Claude: "discover tools on http://localhost:8000/demo_site.html"
+# Then ask Claude: "Discover tools on http://localhost:8000/demo_site.html"
 ```
+
+When Claude calls `call_tool` with a question, the gateway launches a browser, discovers both tools, picks `ask_question` (it matches the Q&A pattern), calls `await tool.execute({question: "..."})`, waits 2 seconds for the simulated response, and returns the answer. The AI gets a real answer, not a confirmation.
 
 ---
 
-## What's Next
+## The Codebase
 
-The gateway is intentionally minimal — ~300 lines of core code, three tools, no dependencies beyond Playwright and FastMCP. Here's what we're thinking about:
+```
+src/webmcp_gateway/
+├── __init__.py      # Package version
+├── __main__.py      # python -m webmcp_gateway
+├── cli.py           # CLI entry point (stdio/sse transport)
+├── server.py        # MCP server with 3 tools
+├── detect.py        # Fast HTTP-based detection (no browser)
+└── browser.py       # Playwright discovery & invocation
+```
 
-- **Connection pooling**: Reuse browser instances across calls instead of launching a new one each time
-- **Caching**: Cache discovered tools for a URL so subsequent calls skip discovery
-- **Streaming**: Stream partial responses for long-running LLM tools
-- **Multi-tool calls**: Call multiple tools on the same page in one browser session
-- **Docker image**: One-command deploy for remote SSE mode
-
-The repo is open source at [github.com/salespeak-ai/webmcp-gateway](https://github.com/salespeak-ai/webmcp-gateway). PRs welcome.
+Five files. About 300 lines of core code. The complexity isn't in the gateway — it's in the async patterns that websites use to respond. That's what [the next post](/blog/webmcp-async-responses) covers in depth.
 
 ---
 
 ## The Bigger Picture
 
-WebMCP Gateway is a bet on a future where every website is also an API — where the line between "browsing" and "using tools" disappears. Today, if you want to check a company's pricing, you visit their website and read. Tomorrow, your AI assistant visits the website and reads for you — using the site's own declared capabilities, not brittle scraping.
+WebMCP Gateway is a bet on a future where every website is also an API. Where the line between "browsing" and "calling tools" disappears.
 
-The WebMCP standard makes this possible. The gateway makes it practical today.
+Today, if you want to compare pricing across three vendors, you open three browser tabs and manually read through each site. Tomorrow, you ask Claude:
 
 ```
-You: "What's the return policy on three different stores?"
+You: "Compare pricing on store-a.com, store-b.com, and store-c.com"
 
-Claude: [calls check_webmcp on store-a.com, store-b.com, store-c.com]
+Claude: [calls check_webmcp on all three]
 Claude: [calls call_tool on each one that has WebMCP]
 Claude: "Here's a comparison:
-  - Store A: 30-day returns, free shipping on returns
-  - Store B: 14-day returns, $8 return label
-  - Store C: 60-day returns, free returns for members"
+  - Store A: 30-day returns, free shipping. Pro plan $99/mo.
+  - Store B: 14-day returns, $8 return shipping. Starts at $79/mo.
+  - Store C: 60-day returns, free for members. Enterprise only, custom pricing."
 ```
 
-That's the vision. Try it: `pip install webmcp-gateway && playwright install chromium`.
+The website decides what to expose. The AI decides what to ask. The gateway handles the plumbing.
+
+Try it: `pip install webmcp-gateway && playwright install chromium`.
+
+---
+
+*WebMCP Gateway is open source under the MIT license. Built by [Salespeak AI](https://salespeak.ai).*
