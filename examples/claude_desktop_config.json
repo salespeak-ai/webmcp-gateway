@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "webmcp-gateway": {
+      "command": "webmcp-gateway",
+      "args": ["--transport", "stdio"]
+    }
+  }
+}

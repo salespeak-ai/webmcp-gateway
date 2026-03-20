@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebMCP Demo — iframe postMessage Pattern</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+        .status { padding: 12px; border-radius: 8px; margin: 16px 0; }
+        .ready { background: #d4edda; color: #155724; }
+        .log { background: #f8f9fa; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 14px; max-height: 400px; overflow-y: auto; }
+        .log-entry { margin: 4px 0; }
+        .log-entry.send { color: #0066cc; }
+        .log-entry.receive { color: #228b22; }
+        .log-entry.info { color: #666; }
+        iframe { border: 1px solid #ddd; border-radius: 8px; margin: 16px 0; }
+    </style>
+</head>
+<body>
+    <h1>WebMCP Demo — iframe Pattern</h1>
+    <p>
+        This demonstrates the <strong>iframe postMessage bridge</strong> pattern,
+        which is how real-world chat widgets work with WebMCP. The execute() callback
+        returns a Promise that stays pending until the iframe posts back the response.
+    </p>
+    <div id="status" class="status">Initializing...</div>
+
+    <!-- Simulated chat widget iframe (inline via srcdoc for demo purposes) -->
+    <h3>Chat Widget (iframe)</h3>
+    <iframe id="chat-iframe" width="100%" height="200" srcdoc='
+        <!DOCTYPE html>
+        <html>
+        <body style="font-family: system-ui; padding: 16px; margin: 0;">
+            <div id="chat" style="font-size: 14px; color: #333;"><em>Widget ready. Waiting for questions...</em></div>
+            <script>
+                const chatEl = document.getElementById("chat");
+
+                window.addEventListener("message", async (event) => {
+                    if (!event.data || !event.data.question) return;
+
+                    const { question, _callId } = event.data;
+                    chatEl.innerHTML += `<div style="color:#0066cc; margin:4px 0;">Q: ${question}</div>`;
+
+                    // Simulate LLM processing (3 seconds)
+                    chatEl.innerHTML += `<div style="color:#999; margin:4px 0;">Thinking...</div>`;
+                    await new Promise(r => setTimeout(r, 3000));
+
+                    const answer = `Thanks for asking about "${question}". Our platform supports WebMCP integration, allowing AI assistants to interact with websites programmatically. Pricing starts at $49/mo.`;
+
+                    chatEl.innerHTML += `<div style="color:#228b22; margin:4px 0;">A: ${answer.substring(0, 60)}...</div>`;
+
+                    // Post the response BACK to parent with the matching callId
+                    window.parent.postMessage({
+                        botResponse: answer,
+                        _callId: _callId
+                    }, "*");
+                });
+            </script>
+        </body>
+        </html>
+    '></iframe>
+
+    <h3>Event Log</h3>
+    <div id="log" class="log"><em>Waiting for tool calls...</em></div>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const logEl = document.getElementById('log');
+        let callCounter = 0;
+        let logCount = 0;
+        const TIMEOUT_MS = 60_000;
+
+        function addLog(message, type = 'info') {
+            if (logCount === 0) logEl.innerHTML = '';
+            logCount++;
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // Wait for navigator.modelContext
+        const checkInterval = setInterval(() => {
+            if (!navigator.modelContext) return;
+            clearInterval(checkInterval);
+
+            const chatIframe = document.getElementById('chat-iframe');
+
+            navigator.modelContext.registerTool({
+                name: "ask_question",
+                description: "Ask a question — uses iframe postMessage bridge to get the actual AI response",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        question: { type: "string", description: "The question to ask" }
+                    },
+                    required: ["question"]
+                },
+                execute: ({ question }) => {
+                    if (!question || typeof question !== 'string') {
+                        return { content: [{ type: 'text', text: 'Error: question is required' }] };
+                    }
+
+                    // Unique correlation ID for this call
+                    const callId = `webmcp_${++callCounter}_${Date.now()}`;
+                    addLog(`execute() called — question: "${question}"`, 'info');
+                    addLog(`Generated callId: ${callId}`, 'info');
+
+                    // Return a Promise that resolves when the iframe responds
+                    return new Promise((resolve) => {
+                        let timeoutId;
+
+                        const cleanup = () => {
+                            clearTimeout(timeoutId);
+                            window.removeEventListener('message', onMessage);
+                        };
+
+                        // Listen for the iframe's response
+                        const onMessage = (event) => {
+                            if (
+                                event.data &&
+                                typeof event.data === 'object' &&
+                                'botResponse' in event.data &&
+                                event.data._callId === callId
+                            ) {
+                                addLog(`Response received from iframe (${event.data.botResponse.length} chars)`, 'receive');
+                                addLog(`Promise resolving — AI agent gets the answer`, 'receive');
+                                cleanup();
+                                resolve({
+                                    content: [{ type: 'text', text: event.data.botResponse }]
+                                });
+                            }
+                        };
+
+                        window.addEventListener('message', onMessage);
+                        addLog(`Message listener registered, waiting for iframe response...`, 'info');
+
+                        // Timeout fallback
+                        timeoutId = setTimeout(() => {
+                            addLog(`TIMEOUT after ${TIMEOUT_MS/1000}s — resolving with timeout message`, 'info');
+                            cleanup();
+                            resolve({
+                                content: [{
+                                    type: 'text',
+                                    text: `Request timed out after ${TIMEOUT_MS/1000}s.`
+                                }]
+                            });
+                        }, TIMEOUT_MS);
+
+                        // Send question to iframe
+                        addLog(`Posting message to iframe: { question, _callId }`, 'send');
+                        chatIframe.contentWindow.postMessage(
+                            { question, _callId: callId },
+                            '*'
+                        );
+                        addLog(`Message sent — Promise is PENDING (waiting for iframe response)`, 'send');
+                    });
+                }
+            });
+
+            statusEl.textContent = 'WebMCP tool registered: ask_question (iframe postMessage pattern)';
+            statusEl.className = 'status ready';
+        }, 50);
+    </script>
+</body>
+</html>

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebMCP Demo Site</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+        .status { padding: 12px; border-radius: 8px; margin: 16px 0; }
+        .ready { background: #d4edda; color: #155724; }
+        .log { background: #f8f9fa; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 14px; max-height: 300px; overflow-y: auto; }
+        .log-entry { margin: 4px 0; }
+    </style>
+</head>
+<body>
+    <h1>WebMCP Demo Site</h1>
+    <p>This page registers a WebMCP tool that AI assistants can discover and call via the WebMCP Gateway.</p>
+    <div id="status" class="status">Initializing WebMCP...</div>
+    <h3>Tool Invocation Log</h3>
+    <div id="log" class="log"><em>Waiting for tool calls...</em></div>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const logEl = document.getElementById('log');
+        let callCount = 0;
+
+        function addLog(message) {
+            if (callCount === 0) logEl.innerHTML = '';
+            callCount++;
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.textContent = `[${new Date().toLocaleTimeString()}] #${callCount}: ${message}`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // Wait for navigator.modelContext to be available
+        const checkInterval = setInterval(() => {
+            if (!navigator.modelContext) return;
+            clearInterval(checkInterval);
+
+            // Register a simple Q&A tool
+            navigator.modelContext.registerTool({
+                name: "ask_question",
+                description: "Ask a question about our demo company. Returns helpful information about our products, pricing, and services.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        question: {
+                            type: "string",
+                            description: "The question to ask"
+                        }
+                    },
+                    required: ["question"]
+                },
+                execute: async (args) => {
+                    const question = args.question || "No question provided";
+                    addLog(`Question received: "${question}"`);
+                    addLog(`Processing... (simulating 2s LLM delay)`);
+
+                    // Simulate real-world async delay (LLM processing time).
+                    // The Promise stays pending until the answer is ready.
+                    // The gateway's headless browser awaits this Promise.
+                    await new Promise(r => setTimeout(r, 2000));
+
+                    const answer = `You asked: "${question}". Here's our answer: We're a demo company showcasing WebMCP integration. Our products include Widget Pro ($99/mo), Widget Enterprise ($299/mo), and Widget Free (free tier). We support email, chat, and phone contact.`;
+                    addLog(`Answer ready (${answer.length} chars) — resolving Promise`);
+
+                    // Return in MCP content format. The gateway parses this.
+                    return {
+                        content: [{ type: "text", text: answer }]
+                    };
+                }
+            });
+
+            // Register a structured tool
+            navigator.modelContext.registerTool({
+                name: "search_products",
+                description: "Search for products by category, price range, and features",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        category: { type: "string", description: "Product category (e.g. 'widgets', 'integrations')" },
+                        max_price: { type: "number", description: "Maximum monthly price in USD" },
+                        features: { type: "array", items: { type: "string" }, description: "Required features" }
+                    },
+                    required: ["category"]
+                },
+                execute: async (args) => {
+                    addLog(`Search: category="${args.category}", max_price=${args.max_price || 'any'}`);
+
+                    const results = [
+                        { name: "Widget Pro", category: "widgets", price: 99, features: ["analytics", "api", "support"] },
+                        { name: "Widget Enterprise", category: "widgets", price: 299, features: ["analytics", "api", "support", "sso", "sla"] },
+                        { name: "Widget Free", category: "widgets", price: 0, features: ["basic-analytics"] },
+                    ];
+
+                    const filtered = results.filter(p => {
+                        if (args.category && p.category !== args.category) return false;
+                        if (args.max_price !== undefined && p.price > args.max_price) return false;
+                        return true;
+                    });
+
+                    return {
+                        content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }]
+                    };
+                }
+            });
+
+            statusEl.textContent = '2 WebMCP tools registered: ask_question, search_products';
+            statusEl.className = 'status ready';
+        }, 50);
+    </script>
+</body>
+</html>
